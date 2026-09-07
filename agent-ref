@@ -1,0 +1,14 @@
+#!/data/data/com.termux/files/usr/bin/bash
+echo "📋 Available Agents by Division:"
+echo ""
+echo "🔧 ENGINEERING:"
+ls ~/.aider/agents/engineering/ | grep .md | sed 's/\.md//' | head -10
+echo ""
+echo "📢 MARKETING:"
+ls ~/.aider/agents/marketing/ | grep .md | sed 's/\.md//' | head -10
+echo ""
+echo "🔒 SECURITY:"
+ls ~/.aider/agents/security/ | grep .md | sed 's/\.md//' | head -10
+echo ""
+echo "💼 SALES:"
+ls ~/.aider/agents/sales/ | grep .md | sed 's/\.md//' | head -10

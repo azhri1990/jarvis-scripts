@@ -1,0 +1,42 @@
+#!/data/data/com.termux/files/usr/bin/bash
+
+# Usage: use_agent <division> <agent> <task>
+# Example: use_agent sales sales-outbound-strategist "Write a follow-up email"
+
+AGENT_FILE="$HOME/.aider/agents/$1/$2.md"
+
+# Also check alternative locations
+if [ ! -f "$AGENT_FILE" ]; then
+    AGENT_FILE="$HOME/.aider/agents/$1-$2.md"
+fi
+
+if [ ! -f "$AGENT_FILE" ]; then
+    AGENT_FILE="$HOME/.aider/agents/$2.md"
+fi
+
+if [ ! -f "$AGENT_FILE" ]; then
+    echo "❌ Agent not found: $1/$2"
+    echo "Available agents in $1:"
+    ls "$HOME/.aider/agents/$1/" 2>/dev/null | grep .md | sed 's/\.md//'
+    exit 1
+fi
+
+AGENT_CONTENT=$(cat "$AGENT_FILE")
+TASK="${@:3}"
+
+echo "🧠 Using agent: $1/$2"
+echo "📝 Task: $TASK"
+echo "⏳ Processing..."
+
+curl -s -X POST http://localhost:20128/v1/chat/completions \
+  -H "Content-Type: application/json" \
+  -H "Authorization: Bearer sk-5f238e76072d7926-92f903-faf6b924xE" \
+  -d "{
+    \"model\": \"qoder/qoder\",
+    \"messages\": [
+      {\"role\": \"system\", \"content\": $(printf '%s' "$AGENT_CONTENT" | jq -Rs .)},
+      {\"role\": \"user\", \"content\": \"$TASK\"}
+    ]
+  }" | jq -r '.choices[0].message.content' 2>/dev/null || echo "❌ Error: Could not connect to OmniRoute"
+
+echo ""
