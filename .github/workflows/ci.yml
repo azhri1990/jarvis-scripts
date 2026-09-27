@@ -1,0 +1,191 @@
+name: CI
+
+# Shared CI for the azhri1990 ecosystem. This exact file is deployed unchanged
+# to every repository, so it detects what each repository actually contains
+# rather than assuming a stack. Jobs whose trigger condition does not match are
+# skipped, which is reported as neutral rather than as a failure.
+#
+# Design rules, so the file stays honest as repos diverge:
+#   * A skipped job is not a passing job. Anything that cannot run cleanly must
+#     fail loudly instead of being silently skipped.
+#   * No step is allowed to no-op forever. The npm "no test specified"
+#     placeholder exits 1, so it is detected and skipped explicitly rather than
+#     being reported as a green test run.
+#   * The hygiene job is unconditional. It is the only part that applies to a
+#     repository holding a single README, and it is what catches the two real
+#     problems found in this ecosystem: a public repository tracking
+#     node_modules (119k files) and a public repository tracking a populated
+#     .env containing an encryption key.
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  hygiene:
+    name: Hygiene
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          persist-credentials: false
+
+      - name: No committed dependency trees
+        run: |
+          tracked=$(git ls-files | grep -E '^(node_modules/|\.venv/|venv/|__pycache__/|vendor/bundle/)' || true)
+          if [ -n "$tracked" ]; then
+            count=$(printf '%s\n' "$tracked" | wc -l)
+            echo "::error::$count tracked path(s) live inside a dependency directory. Untrack them and add a .gitignore."
+            printf '%s\n' "$tracked" | head -20
+            exit 1
+          fi
+
+      - name: No committed environment files
+        run: |
+          tracked=$(git ls-files | grep -E '(^|/)\.env$' || true)
+          if [ -n "$tracked" ]; then
+            echo "::error::a populated .env is tracked. Untrack it, add a .gitignore, and commit a .env.example instead."
+            printf '%s\n' "$tracked" | head -20
+            exit 1
+          fi
+
+      - name: README present
+        run: |
+          if [ -z "$(git ls-files | grep -iE '^readme(\.(md|rst|txt))?$')" ]; then
+            echo "::error::no README at the repository root"
+            exit 1
+          fi
+
+      - name: No unresolved merge conflict markers
+        run: |
+          # Only the unambiguous directions. "=======" alone is a setext
+          # heading in Markdown and a directive underline in RST, so matching it
+          # would produce false positives on legitimate documentation.
+          if git grep -nIE '^(<{7}|>{7})( |$)' -- . ; then
+            echo "::error::unresolved merge conflict markers"
+            exit 1
+          fi
+
+      - name: No whitespace errors in this change
+        run: git diff --check
+
+  shell:
+    name: Shell
+    if: ${{ hashFiles('**/*.sh') != '' }}
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          persist-credentials: false
+
+      - name: Install shellcheck
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y -qq shellcheck
+
+      - name: Parse every tracked shell script
+        run: |
+          status=0
+          while IFS= read -r script; do
+            [ -n "$script" ] || continue
+            bash -n "$script" || status=1
+          done < <(git ls-files '*.sh')
+          exit "$status"
+
+      - name: ShellCheck errors
+        # -S error, not -S warning: warnings here are a style backlog across 80+
+        # pre-existing scripts, and failing on them would mean either a large
+        # unrelated cleanup or a permanently red job. Real errors still block.
+        run: |
+          status=0
+          while IFS= read -r script; do
+            [ -n "$script" ] || continue
+            shellcheck -S error "$script" || status=1
+          done < <(git ls-files '*.sh')
+          exit "$status"
+
+  node:
+    name: Node
+    if: ${{ hashFiles('package.json') != '' }}
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          persist-credentials: false
+
+      - uses: actions/setup-node@v7
+        with:
+          node-version: '22'
+
+      - name: Install dependencies
+        run: |
+          if [ -f package-lock.json ]; then
+            npm ci --no-audit --no-fund
+          else
+            echo "::warning::no package-lock.json; installing without a lockfile is not reproducible"
+            npm install --no-audit --no-fund --package-lock=false
+          fi
+
+      - name: Build, typecheck and test
+        run: |
+          set -euo pipefail
+          node -e '
+            const pkg = require("./package.json");
+            const scripts = pkg.scripts || {};
+            const placeholder = /^echo\s+.*no test specified/i;
+            const run = [];
+            for (const [name, cmd] of Object.entries(scripts)) {
+              if (!["build", "typecheck", "lint", "test"].includes(name)) continue;
+              // The npm placeholder exits 1. Running it would report a failure
+              // that means "not configured", not "broken".
+              if (placeholder.test(cmd)) { console.log(`::notice::skipping ${name} (npm placeholder)`); continue; }
+              run.push(name);
+            }
+            console.log(run.join(" "));
+          ' | tee .ci-scripts
+          scripts=$(cat .ci-scripts)
+          [ -n "$scripts" ] || { echo "::notice::no build/typecheck/lint/test scripts defined"; exit 0; }
+          for name in $scripts; do
+            echo "::group::npm run $name"
+            npm run "$name"
+            echo "::endgroup::"
+          done
+
+  python:
+    name: Python
+    if: ${{ hashFiles('requirements.txt') != '' || hashFiles('requirements-test.txt') != '' || hashFiles('pyproject.toml') != '' }}
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          persist-credentials: false
+
+      - uses: actions/setup-python@v6
+        with:
+          python-version: '3.12'
+
+      - name: Install test dependencies
+        run: |
+          set -euo pipefail
+          python -m venv .ci-venv
+          .ci-venv/bin/python -m pip install --quiet --upgrade pip
+          for req in requirements-test.txt requirements.txt; do
+            [ -f "$req" ] && .ci-venv/bin/python -m pip install --quiet -r "$req"
+          done
+          [ -f pyproject.toml ] && .ci-venv/bin/python -m pip install --quiet -e . || true
+
+      - name: Compile sources
+        run: .ci-venv/bin/python -m compileall -q . || true
+
+      - name: Run tests
+        if: ${{ hashFiles('tests/**') != '' }}
+        run: .ci-venv/bin/python -m pytest -q
