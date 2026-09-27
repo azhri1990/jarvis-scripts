@@ -2,20 +2,23 @@ name: CI
 
 # Shared CI for the azhri1990 ecosystem. This exact file is deployed unchanged
 # to every repository, so it detects what each repository actually contains
-# rather than assuming a stack. Jobs whose trigger condition does not match are
+# rather than assuming a stack. Jobs whose detected stack does not match are
 # skipped, which is reported as neutral rather than as a failure.
 #
 # Design rules, so the file stays honest as repos diverge:
+#   * Stack detection happens in the hygiene job, after checkout, and is passed
+#     to the other jobs as outputs. hashFiles() is not available in a job-level
+#     if: because it needs a checkout first, so detection cannot live there.
 #   * A skipped job is not a passing job. Anything that cannot run cleanly must
 #     fail loudly instead of being silently skipped.
-#   * No step is allowed to no-op forever. The npm "no test specified"
-#     placeholder exits 1, so it is detected and skipped explicitly rather than
-#     being reported as a green test run.
+#   * The npm "no test specified" placeholder exits 1. It is detected and
+#     skipped explicitly, so a missing test suite is never reported as a green
+#     test run and never reported as a failure either.
 #   * The hygiene job is unconditional. It is the only part that applies to a
 #     repository holding a single README, and it is what catches the two real
-#     problems found in this ecosystem: a public repository tracking
-#     node_modules (119k files) and a public repository tracking a populated
-#     .env containing an encryption key.
+#     problems found in this ecosystem: a public repository tracking 119k
+#     node_modules files, and a public repository tracking a populated .env
+#     containing an encryption key.
 
 on:
   push:
@@ -34,10 +37,50 @@ jobs:
   hygiene:
     name: Hygiene
     runs-on: ubuntu-latest
+    outputs:
+      shell: ${{ steps.detect.outputs.shell }}
+      node: ${{ steps.detect.outputs.node }}
+      python: ${{ steps.detect.outputs.python }}
+      python-tests: ${{ steps.detect.outputs.python-tests }}
     steps:
       - uses: actions/checkout@v7
         with:
           persist-credentials: false
+
+      - name: Detect stack
+        id: detect
+        run: |
+          set -euo pipefail
+          if git ls-files '*.sh' | grep -q .; then
+            echo "shell=true"  >> "$GITHUB_OUTPUT"
+          else
+            echo "shell=false" >> "$GITHUB_OUTPUT"
+          fi
+          if [ -f package.json ]; then
+            echo "node=true"   >> "$GITHUB_OUTPUT"
+          else
+            echo "node=false"  >> "$GITHUB_OUTPUT"
+          fi
+          if [ -f requirements.txt ] || [ -f requirements-test.txt ] || [ -f pyproject.toml ]; then
+            echo "python=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "python=false" >> "$GITHUB_OUTPUT"
+          fi
+          if git ls-files 'tests/*' 'test/*' | grep -q .; then
+            echo "python-tests=true"  >> "$GITHUB_OUTPUT"
+          else
+            echo "python-tests=false" >> "$GITHUB_OUTPUT"
+          fi
+          {
+            echo "### Detected stack"
+            echo ""
+            echo "| Job | Runs |"
+            echo "| --- | --- |"
+            echo "| Hygiene | always |"
+            echo "| Shell | $(git ls-files '*.sh' | wc -l) shell scripts |"
+            echo "| Node | $([ -f package.json ] && echo yes || echo no) |"
+            echo "| Python | $([ -f requirements.txt ] || [ -f requirements-test.txt ] || [ -f pyproject.toml ] && echo yes || echo no) |"
+          } >> "$GITHUB_STEP_SUMMARY"
 
       - name: No committed dependency trees
         run: |
@@ -67,9 +110,9 @@ jobs:
 
       - name: No unresolved merge conflict markers
         run: |
-          # Only the unambiguous directions. "=======" alone is a setext
+          # Only the unambiguous directions. A bare "=======" is a setext
           # heading in Markdown and a directive underline in RST, so matching it
-          # would produce false positives on legitimate documentation.
+          # would fail legitimate documentation.
           if git grep -nIE '^(<{7}|>{7})( |$)' -- . ; then
             echo "::error::unresolved merge conflict markers"
             exit 1
@@ -80,7 +123,8 @@ jobs:
 
   shell:
     name: Shell
-    if: ${{ hashFiles('**/*.sh') != '' }}
+    needs: hygiene
+    if: needs.hygiene.outputs.shell == 'true'
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v7
@@ -102,8 +146,8 @@ jobs:
           exit "$status"
 
       - name: ShellCheck errors
-        # -S error, not -S warning: warnings here are a style backlog across 80+
-        # pre-existing scripts, and failing on them would mean either a large
+        # -S error, not -S warning: warnings across 80+ pre-existing scripts are
+        # a style backlog, and failing on them would mean either a large
         # unrelated cleanup or a permanently red job. Real errors still block.
         run: |
           status=0
@@ -115,7 +159,8 @@ jobs:
 
   node:
     name: Node
-    if: ${{ hashFiles('package.json') != '' }}
+    needs: hygiene
+    if: needs.hygiene.outputs.node == 'true'
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v7
@@ -135,34 +180,44 @@ jobs:
             npm install --no-audit --no-fund --package-lock=false
           fi
 
-      - name: Build, typecheck and test
+      - name: Find available scripts
+        id: scripts
         run: |
-          set -euo pipefail
-          node -e '
-            const pkg = require("./package.json");
-            const scripts = pkg.scripts || {};
-            const placeholder = /^echo\s+.*no test specified/i;
-            const run = [];
-            for (const [name, cmd] of Object.entries(scripts)) {
-              if (!["build", "typecheck", "lint", "test"].includes(name)) continue;
-              // The npm placeholder exits 1. Running it would report a failure
-              // that means "not configured", not "broken".
-              if (placeholder.test(cmd)) { console.log(`::notice::skipping ${name} (npm placeholder)`); continue; }
-              run.push(name);
-            }
-            console.log(run.join(" "));
-          ' | tee .ci-scripts
-          scripts=$(cat .ci-scripts)
-          [ -n "$scripts" ] || { echo "::notice::no build/typecheck/lint/test scripts defined"; exit 0; }
-          for name in $scripts; do
-            echo "::group::npm run $name"
-            npm run "$name"
-            echo "::endgroup::"
+          for name in build typecheck lint test; do
+            if node -e '
+              const scripts = require("./package.json").scripts || {};
+              const cmd = scripts[process.argv[1]] || "";
+              if (!cmd) process.exit(1);
+              if (/no test specified/i.test(cmd)) process.exit(1);
+              process.exit(0);
+            ' "$name"; then
+              echo "has-$name=true" >> "$GITHUB_OUTPUT"
+            else
+              echo "has-$name=false" >> "$GITHUB_OUTPUT"
+            fi
           done
+          echo "scripts: $(grep -oE 'has-[a-z]+=true' "$GITHUB_OUTPUT" | sed 's/has-//;s/=true//' | tr '\n' ' ')" >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Build
+        if: steps.scripts.outputs.has-build == 'true'
+        run: npm run build
+
+      - name: Typecheck
+        if: steps.scripts.outputs.has-typecheck == 'true'
+        run: npm run typecheck
+
+      - name: Lint
+        if: steps.scripts.outputs.has-lint == 'true'
+        run: npm run lint
+
+      - name: Test
+        if: steps.scripts.outputs.has-test == 'true'
+        run: npm test
 
   python:
     name: Python
-    if: ${{ hashFiles('requirements.txt') != '' || hashFiles('requirements-test.txt') != '' || hashFiles('pyproject.toml') != '' }}
+    needs: hygiene
+    if: needs.hygiene.outputs.python == 'true'
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v7
@@ -173,19 +228,23 @@ jobs:
         with:
           python-version: '3.12'
 
-      - name: Install test dependencies
+      - name: Install dependencies
         run: |
           set -euo pipefail
           python -m venv .ci-venv
           .ci-venv/bin/python -m pip install --quiet --upgrade pip
           for req in requirements-test.txt requirements.txt; do
-            [ -f "$req" ] && .ci-venv/bin/python -m pip install --quiet -r "$req"
+            if [ -f "$req" ]; then
+              .ci-venv/bin/python -m pip install --quiet -r "$req"
+            fi
           done
-          [ -f pyproject.toml ] && .ci-venv/bin/python -m pip install --quiet -e . || true
+          if [ -f pyproject.toml ]; then
+            .ci-venv/bin/python -m pip install --quiet -e . || echo "::warning::editable install failed; continuing with test dependencies only"
+          fi
 
-      - name: Compile sources
-        run: .ci-venv/bin/python -m compileall -q . || true
+      - name: Compile all Python sources
+        run: .ci-venv/bin/python -m compileall -q -x '\.ci-venv' .
 
       - name: Run tests
-        if: ${{ hashFiles('tests/**') != '' }}
+        if: needs.hygiene.outputs.python-tests == 'true'
         run: .ci-venv/bin/python -m pytest -q
